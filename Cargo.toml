@@ -1,0 +1,43 @@
+[package]
+name = "gradewatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+argon2 = { version = "0.5", features = ["std"] }
+askama = "0.12"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ctrlc = "3.4"
+dotenvy = "0.15"
+html-escape = "0.2"
+jiff = { version = "0.2", features = ["serde"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "rustls-tls", "smtp-transport"] }
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite_migration = "1.2"
+scraper = "0.19"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "1.0"
+tiny_http = "0.12"
+time = "=0.3.44"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ureq = { version = "3", default-features = false, features = ["cookies", "gzip", "json", "rustls"] }
+url = "2.5"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

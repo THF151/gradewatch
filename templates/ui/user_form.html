@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} - gradewatch</title>
+  <style>
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f4f6f6; color: #172026; }
+    header { background: #102f36; color: white; padding: 20px 28px; }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+    main { max-width: 720px; margin: 0 auto; padding: 24px; }
+    form { background: white; border: 1px solid #d8e0e4; border-radius: 8px; padding: 20px; }
+    label { display: block; font-weight: 700; margin: 14px 0 6px; }
+    input[type=text], input[type=email], input[type=password] { width: 100%; box-sizing: border-box; min-height: 38px; border: 1px solid #cfd8dc; border-radius: 6px; padding: 0 10px; font: inherit; }
+    .row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+    .actions { display: flex; gap: 10px; margin-top: 20px; }
+    .button, button { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0 12px; border-radius: 6px; border: 1px solid #12646f; background: #12646f; color: white; text-decoration: none; font-weight: 650; cursor: pointer; }
+    .button.secondary { background: transparent; color: #12646f; }
+    .hint { color: #5e6c74; font-size: 13px; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <header><h1>{{ title }}</h1></header>
+  <main>
+    <form method="post" action="{{ action }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="text" value="{{ user.name }}" required>
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" value="{{ user.email }}" required>
+      <label for="uni_username">Uni ID</label>
+      <input id="uni_username" name="uni_username" type="text" {% if !is_edit %}required{% endif %}>
+      {% if is_edit %}<div class="hint">Leave empty to keep the stored Uni ID.</div>{% endif %}
+      <label for="uni_password">Uni password</label>
+      <input id="uni_password" name="uni_password" type="password" {% if !is_edit %}required{% endif %}>
+      {% if is_edit %}<div class="hint">Leave empty to keep the stored password.</div>{% endif %}
+      <label class="row"><input type="checkbox" name="enabled" {% if user.enabled %}checked{% endif %}> Enabled</label>
+      {% if !is_edit %}
+      <label class="row"><input type="checkbox" name="notify_initial"> Send initial grade email</label>
+      <div class="hint">Fetch immediately after creating this user and send one change email with every current numbered grade listed as a new result.</div>
+      {% endif %}
+      <div class="actions">
+        <button type="submit">{{ submit_label }}</button>
+        <a class="button secondary" href="/">Cancel</a>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

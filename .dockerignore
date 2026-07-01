@@ -1,0 +1,12 @@
+/target
+/.git
+/.gradewatch.env
+/.env
+/.env.*
+/data
+/coverage
+/legacy-prototype
+/PLAN.md
+*.db
+*.db-shm
+*.db-wal

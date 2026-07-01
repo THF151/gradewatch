@@ -1,0 +1,31 @@
+services:
+  gradewatch:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: gradewatch.env
+        required: false
+        format: raw
+      - path: .env
+        required: false
+        format: raw
+    volumes:
+      - gradewatch-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    healthcheck:
+      test: [ "CMD", "/gradewatch", "--healthcheck" ]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  gradewatch-data:

@@ -1,0 +1,20 @@
+PLAN.md
+/legacy-prototype
+/target
+/.env
+/.env.*
+/gradewatch.env
+!.env.example
+!gradewatch.env.example
+/data
+/coverage
+/.idea
+*.db
+*.db-shm
+*.db-wal
+
+
+# Added by cargo
+
+/target
+/EXPLAIN.md
