@@ -123,6 +123,7 @@ fn web_health_auth_challenge_and_dashboard_work() {
     assert!(body.contains("gradewatch"));
     assert!(body.contains("Student"));
     assert!(body.contains("Next scheduled update"));
+    assert!(body.contains("Sync now"));
 
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap().unwrap();

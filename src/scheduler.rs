@@ -22,6 +22,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct SchedulerState {
     inner: Arc<RwLock<SchedulerSnapshot>>,
+    sync_requested: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,14 +30,23 @@ pub struct SchedulerSnapshot {
     pub next_run_at: Option<SystemTime>,
     pub last_started_at: Option<SystemTime>,
     pub last_finished_at: Option<SystemTime>,
+    pub sync_requested: bool,
 }
 
 impl SchedulerState {
     pub fn snapshot(&self) -> SchedulerSnapshot {
-        self.inner
+        let mut snapshot = self
+            .inner
             .read()
             .expect("scheduler state lock poisoned")
-            .clone()
+            .clone();
+        snapshot.sync_requested = self.sync_requested();
+        snapshot
+    }
+
+    pub fn request_sync_now(&self) {
+        self.sync_requested.store(true, Ordering::SeqCst);
+        self.set_next_run_at(SystemTime::now());
     }
 
     fn mark_started(&self, at: SystemTime) {
@@ -58,6 +68,14 @@ impl SchedulerState {
             .expect("scheduler state lock poisoned")
             .next_run_at = Some(at);
     }
+
+    fn sync_requested(&self) -> bool {
+        self.sync_requested.load(Ordering::SeqCst)
+    }
+
+    fn take_sync_request(&self) -> bool {
+        self.sync_requested.swap(false, Ordering::SeqCst)
+    }
 }
 
 pub fn run_scheduler(
@@ -68,24 +86,37 @@ pub fn run_scheduler(
     state: SchedulerState,
 ) -> Result<(), GradeError> {
     let mut next_tick = Instant::now();
-    let mut next_wall_tick = SystemTime::now();
     while !shutdown.load(Ordering::Relaxed) {
+        if state.take_sync_request() {
+            next_tick = Instant::now();
+            tracing::info!("manual scheduler sync requested; starting cycle now");
+        }
+
         state.mark_started(SystemTime::now());
         run_cycle(&config, &db, &mailer, &shutdown)?;
         state.mark_finished(SystemTime::now());
         next_tick += config.poll_interval;
-        next_wall_tick += config.poll_interval;
         while next_tick <= Instant::now() {
             next_tick += config.poll_interval;
-            next_wall_tick += config.poll_interval;
         }
-        state.set_next_run_at(next_wall_tick);
+
+        if state.take_sync_request() {
+            next_tick = Instant::now();
+            tracing::info!(
+                "manual scheduler sync was queued during cycle; starting another cycle now"
+            );
+            continue;
+        }
+
+        let delay = next_tick.saturating_duration_since(Instant::now());
+        let next_run_at = SystemTime::now() + delay;
+        state.set_next_run_at(next_run_at);
         tracing::info!(
-            next_run_at = %timefmt::format_system_time_utc(next_wall_tick),
-            in_seconds = next_tick.saturating_duration_since(Instant::now()).as_secs(),
+            next_run_at = %timefmt::format_system_time_utc(next_run_at),
+            in_seconds = delay.as_secs(),
             "next scheduler cycle scheduled"
         );
-        sleep_until(next_tick, &shutdown);
+        sleep_until(next_tick, &shutdown, &state);
     }
     Ok(())
 }
@@ -297,9 +328,9 @@ fn jitter_sleep(max: Duration, shutdown: &Arc<AtomicBool>) {
     sleep_for(Duration::from_millis(jitter_ms), shutdown);
 }
 
-fn sleep_until(deadline: Instant, shutdown: &Arc<AtomicBool>) {
+fn sleep_until(deadline: Instant, shutdown: &Arc<AtomicBool>, state: &SchedulerState) {
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Relaxed) || state.sync_requested() {
             return;
         }
         let now = Instant::now();
@@ -335,6 +366,18 @@ mod tests {
             retry_delay(Duration::from_secs(30), Duration::from_secs(60), 4),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn manual_sync_request_wakes_scheduler_sleep() {
+        let state = SchedulerState::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        state.request_sync_now();
+
+        sleep_until(Instant::now() + Duration::from_secs(60), &shutdown, &state);
+        assert!(state.sync_requested());
+        assert!(state.take_sync_request());
+        assert!(!state.sync_requested());
     }
 
     #[test]

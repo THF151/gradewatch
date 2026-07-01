@@ -138,6 +138,8 @@ fn handle_request(request: Request, state: &WebState) -> Result<(), GradeError> 
         user_form(request, None)
     } else if method == Method::Post && path == "/users" {
         create_user(request, state)
+    } else if method == Method::Post && path == "/sync-now" {
+        sync_now(request, state)
     } else if method == Method::Post && path == "/test-mail" {
         test_mail(request, state)
     } else if method == Method::Get && path.starts_with("/users/") && path.ends_with("/edit") {
@@ -190,20 +192,27 @@ fn dashboard(request: Request, state: &WebState, flash: String) -> Result<(), Gr
 }
 
 fn next_scheduler_run_at(state: &WebState) -> String {
-    state
-        .scheduler_state
-        .snapshot()
-        .next_run_at
-        .map(timefmt::format_system_time_utc)
-        .unwrap_or_else(|| "starting".into())
+    let snapshot = state.scheduler_state.snapshot();
+    if snapshot.sync_requested {
+        "queued now".into()
+    } else {
+        snapshot
+            .next_run_at
+            .map(timefmt::format_system_time_utc)
+            .unwrap_or_else(|| "current cycle running".into())
+    }
 }
 
 fn next_scheduler_run_in(state: &WebState) -> String {
     let snapshot = state.scheduler_state.snapshot();
-    snapshot
-        .next_run_at
-        .map(|at| timefmt::relative_from_now(at, std::time::SystemTime::now()))
-        .unwrap_or_else(|| "current cycle is running".into())
+    if snapshot.sync_requested {
+        "waiting for scheduler".into()
+    } else {
+        snapshot
+            .next_run_at
+            .map(|at| timefmt::relative_from_now(at, std::time::SystemTime::now()))
+            .unwrap_or_else(|| "current cycle is running".into())
+    }
 }
 
 fn last_scheduler_run_at(state: &WebState) -> String {
@@ -263,6 +272,14 @@ fn create_user(mut request: Request, state: &WebState) -> Result<(), GradeError>
         return send_initial_notification_now(request, state, id);
     }
     redirect(request, "/?flash=user_added")
+}
+
+fn sync_now(mut request: Request, state: &WebState) -> Result<(), GradeError> {
+    let form = read_form(&mut request)?;
+    require_csrf(&request, &form)?;
+    state.scheduler_state.request_sync_now();
+    tracing::info!("manual scheduler sync requested from web UI");
+    redirect(request, "/?flash=sync_requested")
 }
 
 fn send_initial_notification_now(
@@ -563,6 +580,9 @@ fn flash_from_url(url: &str) -> String {
         Some("user_added") => "User added.".into(),
         Some("user_saved") => "User saved.".into(),
         Some("user_deleted") => "User deleted.".into(),
+        Some("sync_requested") => {
+            "Sync requested. The scheduler will start as soon as possible.".into()
+        }
         _ => String::new(),
     }
 }
@@ -682,6 +702,10 @@ mod tests {
     #[test]
     fn flash_messages_are_mapped() {
         assert_eq!(flash_from_url("/?flash=user_saved"), "User saved.");
+        assert_eq!(
+            flash_from_url("/?flash=sync_requested"),
+            "Sync requested. The scheduler will start as soon as possible."
+        );
         assert_eq!(flash_from_url("/"), "");
     }
 }

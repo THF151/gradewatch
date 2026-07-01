@@ -24,7 +24,7 @@ sha2 = "0.10"
 subtle = "2.6"
 thiserror = "1.0"
 tiny_http = "0.12"
-time = "=0.3.44"
+time = "=0.3.53"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
