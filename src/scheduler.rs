@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use rand::Rng;
@@ -25,12 +25,22 @@ pub struct SchedulerState {
     sync_requested: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedulerPhase {
+    #[default]
+    Starting,
+    Running,
+    Waiting,
+    SyncQueued,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SchedulerSnapshot {
     pub next_run_at: Option<SystemTime>,
     pub last_started_at: Option<SystemTime>,
     pub last_finished_at: Option<SystemTime>,
     pub sync_requested: bool,
+    pub phase: SchedulerPhase,
 }
 
 impl SchedulerState {
@@ -41,16 +51,22 @@ impl SchedulerState {
             .expect("scheduler state lock poisoned")
             .clone();
         snapshot.sync_requested = self.sync_requested();
+        if snapshot.sync_requested {
+            snapshot.phase = SchedulerPhase::SyncQueued;
+        }
         snapshot
     }
 
     pub fn request_sync_now(&self) {
         self.sync_requested.store(true, Ordering::SeqCst);
-        self.set_next_run_at(SystemTime::now());
+        let mut state = self.inner.write().expect("scheduler state lock poisoned");
+        state.phase = SchedulerPhase::SyncQueued;
+        state.next_run_at = Some(SystemTime::now());
     }
 
     fn mark_started(&self, at: SystemTime) {
         let mut state = self.inner.write().expect("scheduler state lock poisoned");
+        state.phase = SchedulerPhase::Running;
         state.last_started_at = Some(at);
         state.next_run_at = None;
     }
@@ -62,11 +78,10 @@ impl SchedulerState {
             .last_finished_at = Some(at);
     }
 
-    fn set_next_run_at(&self, at: SystemTime) {
-        self.inner
-            .write()
-            .expect("scheduler state lock poisoned")
-            .next_run_at = Some(at);
+    fn mark_waiting(&self, at: SystemTime) {
+        let mut state = self.inner.write().expect("scheduler state lock poisoned");
+        state.phase = SchedulerPhase::Waiting;
+        state.next_run_at = Some(at);
     }
 
     fn sync_requested(&self) -> bool {
@@ -85,38 +100,42 @@ pub fn run_scheduler(
     shutdown: Arc<AtomicBool>,
     state: SchedulerState,
 ) -> Result<(), GradeError> {
-    let mut next_tick = Instant::now();
+    let mut next_run_at = SystemTime::now();
     while !shutdown.load(Ordering::Relaxed) {
         if state.take_sync_request() {
-            next_tick = Instant::now();
+            next_run_at = SystemTime::now();
             tracing::info!("manual scheduler sync requested; starting cycle now");
         }
 
-        state.mark_started(SystemTime::now());
+        let started_at = SystemTime::now();
+        tracing::info!(
+            scheduled_for = %timefmt::format_system_time_utc(next_run_at),
+            started_at = %timefmt::format_system_time_utc(started_at),
+            overdue_by_seconds = overdue_by_seconds(next_run_at, started_at),
+            "scheduler cycle deadline reached; starting cycle"
+        );
+        state.mark_started(started_at);
         run_cycle(&config, &db, &mailer, &shutdown)?;
-        state.mark_finished(SystemTime::now());
-        next_tick += config.poll_interval;
-        while next_tick <= Instant::now() {
-            next_tick += config.poll_interval;
-        }
+        let finished_at = SystemTime::now();
+        state.mark_finished(finished_at);
 
         if state.take_sync_request() {
-            next_tick = Instant::now();
+            next_run_at = SystemTime::now();
             tracing::info!(
                 "manual scheduler sync was queued during cycle; starting another cycle now"
             );
             continue;
         }
 
-        let delay = next_tick.saturating_duration_since(Instant::now());
-        let next_run_at = SystemTime::now() + delay;
-        state.set_next_run_at(next_run_at);
+        next_run_at = next_deadline_after(next_run_at, config.poll_interval, finished_at);
+        let delay = delay_until(next_run_at, SystemTime::now());
+        state.mark_waiting(next_run_at);
         tracing::info!(
             next_run_at = %timefmt::format_system_time_utc(next_run_at),
             in_seconds = delay.as_secs(),
             "next scheduler cycle scheduled"
         );
-        sleep_until(next_tick, &shutdown, &state);
+        sleep_until(next_run_at, &shutdown, &state);
     }
     Ok(())
 }
@@ -328,29 +347,94 @@ fn jitter_sleep(max: Duration, shutdown: &Arc<AtomicBool>) {
     sleep_for(Duration::from_millis(jitter_ms), shutdown);
 }
 
-fn sleep_until(deadline: Instant, shutdown: &Arc<AtomicBool>, state: &SchedulerState) {
+fn next_deadline_after(
+    previous_deadline: SystemTime,
+    interval: Duration,
+    now: SystemTime,
+) -> SystemTime {
+    if interval.is_zero() {
+        return now;
+    }
+
+    let mut deadline = previous_deadline;
+    loop {
+        deadline = deadline.checked_add(interval).unwrap_or(now);
+        if deadline_after(deadline, now) {
+            return deadline;
+        }
+    }
+}
+
+fn deadline_after(deadline: SystemTime, now: SystemTime) -> bool {
+    deadline
+        .duration_since(now)
+        .map(|remaining| !remaining.is_zero())
+        .unwrap_or(false)
+}
+
+fn deadline_due(deadline: SystemTime, now: SystemTime) -> bool {
+    !deadline_after(deadline, now)
+}
+
+fn delay_until(deadline: SystemTime, now: SystemTime) -> Duration {
+    deadline.duration_since(now).unwrap_or(Duration::ZERO)
+}
+
+fn overdue_by_seconds(deadline: SystemTime, now: SystemTime) -> u64 {
+    now.duration_since(deadline)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+fn sleep_until(deadline: SystemTime, shutdown: &Arc<AtomicBool>, state: &SchedulerState) {
     loop {
         if shutdown.load(Ordering::Relaxed) || state.sync_requested() {
             return;
         }
-        let now = Instant::now();
-        if now >= deadline {
+        let now = SystemTime::now();
+        if deadline_due(deadline, now) {
             return;
         }
-        sleep_for((deadline - now).min(Duration::from_secs(1)), shutdown);
+        sleep_until_interruptible(
+            delay_until(deadline, now).min(Duration::from_secs(1)),
+            shutdown,
+            state,
+        );
+    }
+}
+
+fn sleep_until_interruptible(
+    duration: Duration,
+    shutdown: &Arc<AtomicBool>,
+    state: &SchedulerState,
+) {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline
+        && !shutdown.load(Ordering::Relaxed)
+        && !state.sync_requested()
+    {
+        thread::sleep((deadline - std::time::Instant::now()).min(Duration::from_millis(250)));
     }
 }
 
 fn sleep_for(duration: Duration, shutdown: &Arc<AtomicBool>) {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
-        thread::sleep((deadline - Instant::now()).min(Duration::from_millis(250)));
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
+        thread::sleep((deadline - std::time::Instant::now()).min(Duration::from_millis(250)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        thread,
+        time::{Duration, Instant, UNIX_EPOCH},
+    };
+
+    fn at_seconds(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
 
     #[test]
     fn retry_delay_caps() {
@@ -374,10 +458,107 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         state.request_sync_now();
 
-        sleep_until(Instant::now() + Duration::from_secs(60), &shutdown, &state);
+        sleep_until(
+            SystemTime::now() + Duration::from_secs(60),
+            &shutdown,
+            &state,
+        );
         assert!(state.sync_requested());
         assert!(state.take_sync_request());
         assert!(!state.sync_requested());
+    }
+
+    #[test]
+    fn next_deadline_preserves_normal_cadence() {
+        let previous_due = at_seconds(10 * 60 * 60);
+        let now = previous_due + Duration::from_secs(5);
+
+        assert_eq!(
+            next_deadline_after(previous_due, Duration::from_secs(60 * 60), now),
+            at_seconds(11 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn next_deadline_skips_missed_intervals_after_slow_cycle() {
+        let previous_due = at_seconds(10 * 60 * 60);
+        let now = at_seconds(12 * 60 * 60 + 30 * 60);
+
+        assert_eq!(
+            next_deadline_after(previous_due, Duration::from_secs(60 * 60), now),
+            at_seconds(13 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn next_deadline_handles_laptop_sleep_resume_case() {
+        let previous_due = at_seconds(16 * 60 * 60 + 55 * 60);
+        let resumed_at = at_seconds(18 * 60 * 60 + 25 * 60);
+
+        assert_eq!(
+            next_deadline_after(previous_due, Duration::from_secs(60 * 60), resumed_at),
+            at_seconds(18 * 60 * 60 + 55 * 60)
+        );
+    }
+
+    #[test]
+    fn next_deadline_advances_on_exact_boundary() {
+        let previous_due = at_seconds(10 * 60 * 60);
+        let now = at_seconds(11 * 60 * 60);
+
+        assert_eq!(
+            next_deadline_after(previous_due, Duration::from_secs(60 * 60), now),
+            at_seconds(12 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn past_wall_clock_deadline_returns_immediately() {
+        let state = SchedulerState::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+
+        sleep_until(UNIX_EPOCH, &shutdown, &state);
+
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn future_wall_clock_deadline_waits_until_due() {
+        let state = SchedulerState::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+
+        sleep_until(
+            SystemTime::now() + Duration::from_millis(25),
+            &shutdown,
+            &state,
+        );
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn sync_request_wakes_future_wall_clock_deadline() {
+        let state = SchedulerState::default();
+        let sleep_state = state.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sleep_shutdown = Arc::clone(&shutdown);
+        let started = Instant::now();
+
+        let handle = thread::spawn(move || {
+            sleep_until(
+                SystemTime::now() + Duration::from_secs(60),
+                &sleep_shutdown,
+                &sleep_state,
+            );
+        });
+        thread::sleep(Duration::from_millis(20));
+        state.request_sync_now();
+        handle.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(state.sync_requested());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
@@ -20,7 +20,7 @@ use crate::{
     error::GradeError,
     mailer::{MailFailure, Mailer, deliver_pending},
     portal::fetch::PortalClient,
-    scheduler::SchedulerState,
+    scheduler::{SchedulerPhase, SchedulerSnapshot, SchedulerState},
     timefmt,
 };
 
@@ -54,6 +54,13 @@ struct UserFormView {
     name: String,
     email: String,
     enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerDisplay {
+    next_run_at: String,
+    next_run_in: String,
+    last_finished_at: String,
 }
 
 #[derive(Template)]
@@ -177,12 +184,13 @@ fn dashboard(request: Request, state: &WebState, flash: String) -> Result<(), Gr
         .into_iter()
         .map(UserView::from)
         .collect();
+    let scheduler = scheduler_display(state.scheduler_state.snapshot(), SystemTime::now());
     let html = DashboardTemplate {
         users,
         pending_count: state.db.pending_count()?,
-        next_scheduler_run_at: next_scheduler_run_at(state),
-        next_scheduler_run_in: next_scheduler_run_in(state),
-        last_scheduler_run_at: last_scheduler_run_at(state),
+        next_scheduler_run_at: scheduler.next_run_at,
+        next_scheduler_run_in: scheduler.next_run_in,
+        last_scheduler_run_at: scheduler.last_finished_at,
         csrf: csrf.clone(),
         flash,
     }
@@ -191,37 +199,59 @@ fn dashboard(request: Request, state: &WebState, flash: String) -> Result<(), Gr
     respond_html_with_csrf(request, html, &csrf)
 }
 
-fn next_scheduler_run_at(state: &WebState) -> String {
-    let snapshot = state.scheduler_state.snapshot();
-    if snapshot.sync_requested {
-        "queued now".into()
-    } else {
-        snapshot
-            .next_run_at
-            .map(timefmt::format_system_time_utc)
-            .unwrap_or_else(|| "current cycle running".into())
-    }
-}
-
-fn next_scheduler_run_in(state: &WebState) -> String {
-    let snapshot = state.scheduler_state.snapshot();
-    if snapshot.sync_requested {
-        "waiting for scheduler".into()
-    } else {
-        snapshot
-            .next_run_at
-            .map(|at| timefmt::relative_from_now(at, std::time::SystemTime::now()))
-            .unwrap_or_else(|| "current cycle is running".into())
-    }
-}
-
-fn last_scheduler_run_at(state: &WebState) -> String {
-    state
-        .scheduler_state
-        .snapshot()
+fn scheduler_display(snapshot: SchedulerSnapshot, now: SystemTime) -> SchedulerDisplay {
+    let last_finished_at = snapshot
         .last_finished_at
         .map(timefmt::format_system_time_utc)
-        .unwrap_or_else(|| "not finished yet".into())
+        .unwrap_or_else(|| "not finished yet".into());
+
+    let (next_run_at, next_run_in) =
+        if snapshot.sync_requested || snapshot.phase == SchedulerPhase::SyncQueued {
+            ("queued now".into(), "waiting for scheduler".into())
+        } else if snapshot.phase == SchedulerPhase::Running {
+            (
+                "current cycle running".into(),
+                "current cycle is running".into(),
+            )
+        } else if let Some(next_run_at) = snapshot.next_run_at {
+            if scheduler_deadline_is_stale_or_due(&snapshot, next_run_at, now) {
+                ("due now".into(), "scheduler waking".into())
+            } else {
+                (
+                    timefmt::format_system_time_utc(next_run_at),
+                    timefmt::relative_from_now(next_run_at, now),
+                )
+            }
+        } else if snapshot.phase == SchedulerPhase::Waiting {
+            (
+                "scheduler waking".into(),
+                "waiting for next deadline".into(),
+            )
+        } else {
+            ("starting".into(), "waiting for first cycle".into())
+        };
+
+    SchedulerDisplay {
+        next_run_at,
+        next_run_in,
+        last_finished_at,
+    }
+}
+
+fn scheduler_deadline_is_stale_or_due(
+    snapshot: &SchedulerSnapshot,
+    next_run_at: SystemTime,
+    now: SystemTime,
+) -> bool {
+    let due = next_run_at
+        .duration_since(now)
+        .map(|remaining| remaining.is_zero())
+        .unwrap_or(true);
+    let stale = snapshot
+        .last_finished_at
+        .and_then(|last_finished_at| last_finished_at.duration_since(next_run_at).ok())
+        .is_some();
+    due || stale
 }
 
 fn user_form(request: Request, user: Option<UserSummary>) -> Result<(), GradeError> {
@@ -685,6 +715,7 @@ impl From<UserSummary> for UserFormView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn parses_user_routes() {
@@ -707,5 +738,53 @@ mod tests {
             "Sync requested. The scheduler will start as soon as possible."
         );
         assert_eq!(flash_from_url("/"), "");
+    }
+
+    #[test]
+    fn scheduler_display_hides_stale_next_run() {
+        let display = scheduler_display(
+            SchedulerSnapshot {
+                phase: SchedulerPhase::Waiting,
+                next_run_at: Some(UNIX_EPOCH + Duration::from_secs(60)),
+                last_finished_at: Some(UNIX_EPOCH + Duration::from_secs(120)),
+                ..SchedulerSnapshot::default()
+            },
+            UNIX_EPOCH + Duration::from_secs(180),
+        );
+
+        assert_eq!(display.next_run_at, "due now");
+        assert_eq!(display.next_run_in, "scheduler waking");
+        assert!(!display.next_run_in.contains("ago"));
+    }
+
+    #[test]
+    fn scheduler_display_reports_running_cycle() {
+        let display = scheduler_display(
+            SchedulerSnapshot {
+                phase: SchedulerPhase::Running,
+                last_started_at: Some(UNIX_EPOCH + Duration::from_secs(60)),
+                ..SchedulerSnapshot::default()
+            },
+            UNIX_EPOCH + Duration::from_secs(90),
+        );
+
+        assert_eq!(display.next_run_at, "current cycle running");
+        assert_eq!(display.next_run_in, "current cycle is running");
+    }
+
+    #[test]
+    fn scheduler_display_reports_queued_manual_sync() {
+        let display = scheduler_display(
+            SchedulerSnapshot {
+                phase: SchedulerPhase::SyncQueued,
+                next_run_at: Some(UNIX_EPOCH + Duration::from_secs(60)),
+                sync_requested: true,
+                ..SchedulerSnapshot::default()
+            },
+            UNIX_EPOCH + Duration::from_secs(30),
+        );
+
+        assert_eq!(display.next_run_at, "queued now");
+        assert_eq!(display.next_run_in, "waiting for scheduler");
     }
 }
