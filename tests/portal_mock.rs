@@ -96,6 +96,98 @@ fn cas_login_redirect_and_grade_fetch_work_against_mock() {
 }
 
 #[test]
+fn english_locale_grade_fetch_works_against_mock() {
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    let base = format!("http://{addr}");
+
+    let handle = thread::spawn(move || {
+        let mut authed_grade_hits = 0;
+        while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(2)) {
+            let path = request.url().to_string();
+            let method = request.method().clone();
+            let cookie = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Cookie"))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
+
+            if method == Method::Get && path.starts_with("/leistungen") {
+                if cookie.contains("portal_session=ok") {
+                    authed_grade_hits += 1;
+                    request
+                        .respond(html_response(include_str!(
+                            "fixtures/meine_leistungen_en.html"
+                        )))
+                        .unwrap();
+                } else {
+                    request
+                        .respond(
+                            html_response("<html>not logged in</html>")
+                                .with_status_code(StatusCode(403)),
+                        )
+                        .unwrap();
+                }
+            } else if method == Method::Get && path.starts_with("/cas/login") {
+                request
+                    .respond(html_response(
+                        r#"<form action="/cas/login">
+                             <input name="execution" value="e1s1">
+                             <input name="_eventId" value="submit">
+                           </form>"#,
+                    ))
+                    .unwrap();
+            } else if method == Method::Post && path == "/cas/login" {
+                request
+                    .respond(
+                        Response::empty(StatusCode(302))
+                            .with_header(header("Location", "/service?ticket=ST-1")),
+                    )
+                    .unwrap();
+            } else if method == Method::Get && path.starts_with("/service") {
+                request
+                    .respond(
+                        Response::empty(StatusCode(302))
+                            .with_header(header("Location", "/leistungen"))
+                            .with_header(header("Set-Cookie", "portal_session=ok; Path=/")),
+                    )
+                    .unwrap();
+            } else {
+                request
+                    .respond(Response::from_string("not found").with_status_code(StatusCode(404)))
+                    .unwrap();
+            }
+
+            if authed_grade_hits >= 2 {
+                break;
+            }
+        }
+    });
+
+    let client = PortalClient::new(
+        PortalConfig {
+            cas_login_url: format!("{base}/cas/login"),
+            service_url: format!("{base}/service"),
+            leistungen_url: format!("{base}/leistungen"),
+        },
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+
+    let result = client.fetch_records("uni-user", "uni-pass", None).unwrap();
+    let course = result
+        .records
+        .iter()
+        .find(|record| record.get("Nummer") == "IE 500")
+        .expect("graded course row is parsed from the English page");
+    assert_eq!(course.get("Titel"), "Data Management");
+    assert_eq!(course.get("Bewertung"), "1.7");
+
+    handle.join().unwrap();
+}
+
+#[test]
 fn cas_auth_failure_surfaces_error_text() {
     let server = Server::http("127.0.0.1:0").unwrap();
     let addr = server.server_addr().to_ip().unwrap();

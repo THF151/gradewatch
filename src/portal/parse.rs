@@ -30,8 +30,25 @@ impl GradeRecord {
 
 type Cell = (String, usize);
 
+const GRADE_COLUMN_LABELS: [&str; 2] = ["Bewertung", "Grade"];
+
 pub fn has_grades(html: &str) -> bool {
-    html.contains("treeTableWithIcons") && html.contains("Bewertung")
+    html.contains("treeTableWithIcons")
+        && GRADE_COLUMN_LABELS.iter().any(|label| html.contains(label))
+}
+
+fn canonical_field_name(label: &str) -> String {
+    match label.trim() {
+        "Ebene" | "Level" => "Ebene",
+        "Titel" | "Title" => "Titel",
+        "Nummer" | "Number" => "Nummer",
+        "Versuch" | "Attempt" => "Versuch",
+        "Bewertung" | "Grade" => "Bewertung",
+        "Status" => "Status",
+        "Bonus" | "Malus" => "Bonus",
+        other => other,
+    }
+    .to_string()
 }
 
 pub fn parse_html_grades(html: &str) -> Result<Vec<GradeRecord>, GradeError> {
@@ -44,7 +61,11 @@ pub fn parse_html_grades(html: &str) -> Result<Vec<GradeRecord>, GradeError> {
         let Some(header) = rows.first() else {
             continue;
         };
-        if !normalized_text(header).contains("Bewertung") {
+        let header_text = normalized_text(header);
+        if !GRADE_COLUMN_LABELS
+            .iter()
+            .any(|label| header_text.contains(label))
+        {
             continue;
         }
 
@@ -70,7 +91,7 @@ pub fn parse_html_grades(html: &str) -> Result<Vec<GradeRecord>, GradeError> {
     }
 
     Err(GradeError::Parse(
-        "could not find treeTableWithIcons table with Bewertung header".into(),
+        "could not find treeTableWithIcons table with a grade column header".into(),
     ))
 }
 
@@ -145,7 +166,7 @@ pub fn parse_grades(header: &[Cell], body: &[Vec<Cell>]) -> Vec<GradeRecord> {
     let data_labels = header
         .iter()
         .skip(2)
-        .map(|(text, _)| text.clone())
+        .map(|(text, _)| canonical_field_name(text))
         .collect::<Vec<_>>();
     let n_data = data_labels.len();
 
@@ -231,5 +252,33 @@ mod tests {
         assert_eq!(records[2].get("Titel"), "Datenbanken");
         assert_eq!(records[2].get("Nummer"), "IS-201");
         assert_eq!(records[2].get("Bewertung"), "1,7");
+    }
+
+    #[test]
+    fn detects_and_parses_english_locale_grades() {
+        let html = include_str!("../../tests/fixtures/meine_leistungen_en.html");
+
+        assert!(
+            html.contains("treeTableWithIcons"),
+            "table class is language-independent and still present"
+        );
+        assert!(
+            !html.contains("Bewertung"),
+            "the German grade header is gone in the English locale"
+        );
+
+        assert!(
+            has_grades(html),
+            "grades page must be detected regardless of UI language"
+        );
+
+        let records = parse_html_grades(html).expect("english fixture parses");
+        let course = records
+            .iter()
+            .find(|record| record.nummer() == "IE 500")
+            .expect("graded course row is parsed");
+        assert_eq!(course.titel(), "Data Management");
+        assert_eq!(course.get("Bewertung"), "1.7");
+        assert_eq!(course.get("Status"), "passed");
     }
 }

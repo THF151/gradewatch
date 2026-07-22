@@ -212,7 +212,7 @@ fn clean(value: &str) -> String {
 
 fn is_account_record(record: &GradeRecord) -> bool {
     let kind = record.get("_row_kind").to_ascii_lowercase();
-    if kind.contains("konto") || kind.contains("prüfungsordnung") {
+    if kind.contains("konto") || kind.contains("account") || kind.contains("prüfungsordnung") {
         return true;
     }
 
@@ -225,7 +225,11 @@ fn is_account_snapshot_row(row: &SnapshotRow) -> bool {
 
 fn is_account_title(title: &str) -> bool {
     let title = title.to_ascii_lowercase();
-    title.contains("vorläufige durchschnittsnote") || title.contains("erworbene ects")
+    title.contains("vorläufige durchschnittsnote")
+        || title.contains("erworbene ects")
+        || title.contains("provisional average grade")
+        || title.contains("ects credits earned")
+        || title.contains("ects received")
 }
 
 impl From<SnapshotRow> for NotificationRow {
@@ -339,6 +343,40 @@ mod tests {
         let diff = diff_snapshots_with_initial(None, None, &new, true).unwrap();
         assert_eq!(diff.changes.len(), 1);
         assert_eq!(diff.changes[0].titel, "Data Mining");
+    }
+
+    #[test]
+    fn english_account_rows_are_not_notifiable_snapshot_rows() {
+        let new = canonicalize(&[
+            rec(&[
+                ("_row_kind", "current total"),
+                ("Nummer", "8002-88-277-0-H-2025-K"),
+                (
+                    "Titel",
+                    "provisional average grade | ECTS credits earned until now",
+                ),
+                ("Bewertung", "1.2"),
+            ]),
+            rec(&[
+                ("_row_kind", "Student account"),
+                ("Nummer", "8006-88-277-0-H-2025-K"),
+                ("Titel", "ECTS received in examination held in English"),
+            ]),
+            rec(&[
+                ("_row_kind", "Examination"),
+                ("Nummer", "IE 500"),
+                ("Titel", "Data Management"),
+                ("Bewertung", "1.7"),
+            ]),
+        ])
+        .unwrap();
+
+        assert_eq!(new.rows.len(), 1);
+        assert_eq!(new.rows[0].titel, "Data Management");
+
+        let diff = diff_snapshots_with_initial(None, None, &new, true).unwrap();
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].titel, "Data Management");
     }
 
     #[test]
