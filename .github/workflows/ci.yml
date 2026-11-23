@@ -9,6 +9,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified image to GHCR
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -91,51 +96,225 @@ jobs:
       - name: Tests
         run: make test
 
-  package:
-    name: package
+  package-route:
     runs-on: ubuntu-latest
-    needs:
-      - lint
-      - clippy
-      - build
-      - test
-    permissions:
-      contents: read
-      packages: write
+    outputs:
+      use_gharp: ${{ steps.route.outputs.use_gharp }}
+      nonce: ${{ steps.route.outputs.nonce }}
+      publish: ${{ steps.route.outputs.publish }}
+      image: ${{ steps.route.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Compute image name
-        id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select package runner and publishing mode
+        id: route
+        env:
+          USE_GHARP: ${{ github.repository == 'THF151/gradewatch' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.GRADEWATCH_GHARP != 'false' }}
+          PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+        shell: bash
+        run: |
+          {
+            printf 'use_gharp=%s\n' "$USE_GHARP"
+            printf 'publish=%s\n' "$PUBLISH"
+            printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}"
+            if [[ "$USE_GHARP" == true ]]; then
+              printf 'nonce=%s\n' "$(openssl rand -hex 16)"
+            fi
+          } >> "$GITHUB_OUTPUT"
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image.outputs.name }}
+          images: ${{ steps.route.outputs.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=sha,prefix=sha-
-      - name: Build and publish image
+
+  package-gharp:
+    name: Package on gharp
+    needs: [package-route, lint, clippy, build, test]
+    if: needs.package-route.outputs.use_gharp == 'true'
+    runs-on: gharp-public-rust-4cpu-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.package-route.outputs.nonce }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Cross-compile and stage both static binaries
+        run: bash ci/cross-package.sh
+      - name: Smoke-test both binaries
+        run: |
+          bash ci/smoke-package.sh "$RUNNER_TEMP/gradewatch-package/amd64/gradewatch" amd64
+          bash ci/smoke-package.sh "$RUNNER_TEMP/gradewatch-package/arm64/gradewatch" arm64
+      - name: Log in to GHCR
+        if: needs.package-route.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble both images
+        id: image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          builder: job
+          context: ${{ runner.temp }}/gradewatch-package
+          file: ./Dockerfile.package
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: ${{ needs.package-route.outputs.publish == 'true' }}
+          tags: ${{ needs.package-route.outputs.tags }}
+          labels: ${{ needs.package-route.outputs.labels }}
+          outputs: ${{ needs.package-route.outputs.publish == 'false' && format('type=oci,dest={0}/gradewatch.oci.tar', runner.temp) || '' }}
+      - name: Validate package platforms
+        env:
+          PUBLISH: ${{ needs.package-route.outputs.publish }}
+          IMAGE: ${{ needs.package-route.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          if [[ "$PUBLISH" == true ]]; then
+            docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" | python3 ci/verify-package.py -
+          else
+            python3 ci/verify-package.py "$RUNNER_TEMP/gradewatch.oci.tar"
+          fi
+      - name: Save local Cargo target snapshot
+        run: RUSTUP_TOOLCHAIN=1.99.1 runner-target-cache save "$GITHUB_WORKSPACE/target"
+
+  package-native:
+    name: Prepare ${{ matrix.arch }} binary
+    needs: [package-route, lint, clippy, build, test]
+    if: needs.package-route.outputs.use_gharp == 'false'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up native Rust and musl
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y --no-install-recommends musl-tools
+          fi
+      - name: Cache native Cargo dependencies and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-package-native-v1-${{ matrix.runner }}-${{ matrix.target }}-rust-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+      - name: Build and smoke-test the static binary
+        shell: bash
+        run: |
+          cc_target=${TARGET//-/_}
+          linker_target=${cc_target^^}
+          env "CC_$cc_target=musl-gcc" "CARGO_TARGET_${linker_target}_LINKER=musl-gcc" \
+            cargo build --release --locked --target "$TARGET"
+          install -m 0755 "target/$TARGET/release/gradewatch" "$RUNNER_TEMP/gradewatch"
+          bash ci/smoke-package.sh "$RUNNER_TEMP/gradewatch" "$ARCH"
+      - name: Upload validated binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradewatch-bin-${{ matrix.arch }}
+          path: ${{ runner.temp }}/gradewatch
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+          if-no-files-found: error
+
+  package:
+    name: package
+    needs: [package-route, package-gharp, package-native]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check the selected packaging results
+        env:
+          USE_GHARP: ${{ needs.package-route.outputs.use_gharp }}
+          GHARP_RESULT: ${{ needs.package-gharp.result }}
+          NATIVE_RESULT: ${{ needs.package-native.result }}
+        shell: bash
+        run: |
+          if [[ "$USE_GHARP" == true ]]; then
+            [[ "$GHARP_RESULT" == success ]]
+          else
+            [[ "$USE_GHARP" == false && "$NATIVE_RESULT" == success ]]
+          fi
+      - uses: actions/checkout@v4
+        if: needs.package-route.outputs.use_gharp == 'false'
+        with:
+          persist-credentials: false
+      - name: Download validated binaries
+        if: needs.package-route.outputs.use_gharp == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gradewatch-bin-*
+          path: ${{ runner.temp }}/gradewatch-binaries
+      - name: Stage the small image build context
+        if: needs.package-route.outputs.use_gharp == 'false'
+        shell: bash
+        run: |
+          context="$RUNNER_TEMP/gradewatch-package"
+          for arch in amd64 arm64; do
+            install -D -m 0755 "$RUNNER_TEMP/gradewatch-binaries/gradewatch-bin-$arch/gradewatch" "$context/$arch/gradewatch"
+          done
+          mkdir -p "$context/data"
+          touch "$context/data/.keep"
+      - name: Set up Docker Buildx
+        if: needs.package-route.outputs.use_gharp == 'false'
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: needs.package-route.outputs.use_gharp == 'false' && needs.package-route.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble both images
+        if: needs.package-route.outputs.use_gharp == 'false'
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/gradewatch-package
+          file: ./Dockerfile.package
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.package-route.outputs.publish == 'true' }}
+          tags: ${{ needs.package-route.outputs.tags }}
+          labels: ${{ needs.package-route.outputs.labels }}
+          outputs: ${{ needs.package-route.outputs.publish == 'false' && format('type=oci,dest={0}/gradewatch.oci.tar', runner.temp) || '' }}
+      - name: Validate package platforms
+        if: needs.package-route.outputs.use_gharp == 'false'
+        env:
+          PUBLISH: ${{ needs.package-route.outputs.publish }}
+          IMAGE: ${{ needs.package-route.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          if [[ "$PUBLISH" == true ]]; then
+            docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" | python3 ci/verify-package.py -
+          else
+            python3 ci/verify-package.py "$RUNNER_TEMP/gradewatch.oci.tar"
+          fi
