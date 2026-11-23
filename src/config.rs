@@ -36,8 +36,8 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct PortalConfig {
-    pub cas_login_url: String,
-    pub service_url: String,
+    /// Portal2 endpoint that starts the Shibboleth (SAML) login.
+    pub sso_login_url: String,
     pub leistungen_url: String,
 }
 
@@ -133,13 +133,9 @@ impl Config {
             log_level: string_var("LOG_LEVEL", "info"),
             log_retention_days: u32_var("LOG_RETENTION_DAYS", 14)?,
             portal: PortalConfig {
-                cas_login_url: string_var(
-                    "PORTAL_CAS_LOGIN_URL",
-                    "https://cas.uni-mannheim.de/cas/login",
-                ),
-                service_url: string_var(
-                    "PORTAL_SERVICE_URL",
-                    "https://portal2.uni-mannheim.de/portal2/rds?state=user&type=1",
+                sso_login_url: string_var(
+                    "PORTAL_SSO_LOGIN_URL",
+                    "https://portal2.uni-mannheim.de/portal2/api/identityprovider/redirect/4/login",
                 ),
                 leistungen_url: string_var(
                     "PORTAL_LEISTUNGEN_URL",

@@ -8,9 +8,9 @@ use crate::{
     config::PortalConfig,
     error::GradeError,
     portal::{
-        cas,
         debug::save_debug_html,
         parse::{GradeRecord, has_grades, parse_html_grades},
+        sso,
     },
 };
 
@@ -71,8 +71,8 @@ impl PortalClient {
 
         let mut page = self.fetch_leistungen_page(&agent)?;
         if !has_grades(&page.html) {
-            tracing::info!("no valid cached portal session; starting CAS login");
-            cas::login(
+            tracing::info!("no valid cached portal session; starting Shibboleth SSO login");
+            sso::login(
                 &agent,
                 &self.cfg,
                 username,
@@ -107,7 +107,7 @@ impl PortalClient {
         password: &str,
     ) -> Result<String, GradeError> {
         let agent = self.agent();
-        cas::login(
+        sso::login(
             &agent,
             &self.cfg,
             username,
