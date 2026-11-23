@@ -60,8 +60,7 @@ fn web_health_auth_challenge_and_dashboard_work() {
         log_level: "error".into(),
         log_retention_days: 1,
         portal: PortalConfig {
-            cas_login_url: "http://127.0.0.1/cas".into(),
-            service_url: "http://127.0.0.1/service".into(),
+            sso_login_url: "http://127.0.0.1/sso".into(),
             leistungen_url: "http://127.0.0.1/leistungen".into(),
         },
     };

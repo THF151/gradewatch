@@ -470,7 +470,7 @@ impl Db {
         let count = conn.query_row(
             "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
             [],
-            |row| row.get::<_, usize>(0),
+            |row| get_usize(row, 0),
         )?;
         Ok(count)
     }
@@ -526,8 +526,14 @@ fn user_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserSummar
         consecutive_failures: row.get(7)?,
         last_error_kind: row.get(8)?,
         last_error_at: row.get(9)?,
-        row_count: row.get(10)?,
+        row_count: get_usize(row, 10)?,
     })
+}
+
+/// rusqlite no longer maps SQLite integers to `usize` directly.
+fn get_usize(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<usize> {
+    let value = row.get::<_, i64>(idx)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
 }
 
 fn now() -> String {
